@@ -1771,6 +1771,8 @@ this.zenWorkspaces = class extends ExtensionAPI {
       if (!popupUrl) return false;
 
       if (options.triggerAction !== false) {
+        installExtensionPopupWindowOpenIntercept();
+        suppressExtensionPopupGeometryBriefly();
         try {
           popupUrl = browserAction.action.triggerClickOrPopup(tab, clickInfo || { button: 0, modifiers: [] }) || popupUrl;
         } catch (e) {
@@ -2053,6 +2055,7 @@ this.zenWorkspaces = class extends ExtensionAPI {
       // viewType: null so the hosted browser presents as a popout window
       // (no `webextension-view-type` attribute) — see createBrowserElement
       // for the reasoning. The icon-strip path stays at the default "popup".
+      suppressExtensionPopupGeometryBriefly();
       chromeViewTransitions.openExtensionPopup({ popupUrl, extensionId: resolved.id, viewType: null });
     }
 
@@ -2099,6 +2102,9 @@ this.zenWorkspaces = class extends ExtensionAPI {
     // openings between init and that first push (rare in practice) match
     // the default-on behavior the user configured.
     let interceptEnabled = true;
+    let suppressExtensionPopupGeometryUntil = 0;
+    let extensionPopupWindowFallbackListener = null;
+    const EXTENSION_POPUP_GEOMETRY_GUARD = "__zenTabsPanelExtensionPopupGeometryGuard";
     // Default matches STORAGE_DEFAULTS.skipOverlayAnimations (false —
     // animations on). Background pushes the persisted value via
     // setSkipOverlayAnimations after init. Used by the overlay, panel
@@ -2112,6 +2118,155 @@ this.zenWorkspaces = class extends ExtensionAPI {
     function overlayBackdropColor() {
       return dimBackdrop ? "rgba(0, 0, 0, 0.25)" : "transparent";
     }
+
+    function suppressExtensionPopupGeometryBriefly() {
+      suppressExtensionPopupGeometryUntil = Date.now() + 1500;
+    }
+
+    function shouldSuppressExtensionPopupGeometry() {
+      return Date.now() < suppressExtensionPopupGeometryUntil &&
+        overlayController.isOpen() &&
+        currentViewName() === "extension-popup";
+    }
+
+    function installExtensionPopupGeometryGuard() {
+      const w = getWin();
+      if (!w) return;
+      const existing = w[EXTENSION_POPUP_GEOMETRY_GUARD];
+      if (existing) {
+        try { w.moveTo = existing.originalMoveTo; } catch (e) {}
+        try { w.resizeTo = existing.originalResizeTo; } catch (e) {}
+        try { delete w[EXTENSION_POPUP_GEOMETRY_GUARD]; } catch (e) {}
+      }
+      const originalMoveTo = w.moveTo;
+      const originalResizeTo = w.resizeTo;
+      // Bitwarden follows its popup-window create with browser.windows.update().
+      // After we intercept the create, Firefox can apply that geometry update to
+      // the fullscreen Zen window, which exits macOS fullscreen. Swallow only the
+      // brief follow-up move/resize while our hosted extension popup is active.
+      w.moveTo = function(...args) {
+        if (shouldSuppressExtensionPopupGeometry()) return undefined;
+        return originalMoveTo.apply(this, args);
+      };
+      w.resizeTo = function(...args) {
+        if (shouldSuppressExtensionPopupGeometry()) return undefined;
+        return originalResizeTo.apply(this, args);
+      };
+      w[EXTENSION_POPUP_GEOMETRY_GUARD] = { originalMoveTo, originalResizeTo };
+      context.callOnClose({
+        close() {
+          const patch = w[EXTENSION_POPUP_GEOMETRY_GUARD];
+          if (!patch) return;
+          try { w.moveTo = patch.originalMoveTo; } catch (e) {}
+          try { w.resizeTo = patch.originalResizeTo; } catch (e) {}
+          try { delete w[EXTENSION_POPUP_GEOMETRY_GUARD]; } catch (e) {}
+        },
+      });
+    }
+
+    installExtensionPopupGeometryGuard();
+
+    function normalizedExtensionPopupDocumentUrl(url) {
+      return String(url || "").replace(/[?#].*$/, "");
+    }
+
+    function defaultActionPopupUrlForExtension(ext) {
+      const action = ext?.manifest?.action || ext?.manifest?.browser_action;
+      const popupPath = action?.default_popup;
+      if (!popupPath) return null;
+      if (/^moz-extension:\/\//.test(popupPath)) return popupPath;
+      return ext.baseURL + String(popupPath).replace(/^\/+/, "");
+    }
+
+    function isLikelyLeakedExtensionPopupWindow(win, popupUrl) {
+      if (!win || !popupUrl || !String(popupUrl).startsWith("moz-extension://")) return false;
+      const resolved = findExtensionByUrl(popupUrl);
+      if (!resolved || !isForeignBrowserActionId(resolved.id)) return false;
+      const defaultPopupUrl = defaultActionPopupUrlForExtension(resolved.ext);
+      if (
+        defaultPopupUrl &&
+        normalizedExtensionPopupDocumentUrl(popupUrl) !== normalizedExtensionPopupDocumentUrl(defaultPopupUrl)
+      ) {
+        return false;
+      }
+      const href = String(win.location?.href || "");
+      if (href !== "chrome://browser/content/browser.xhtml") return false;
+      const title = String(win.document?.title || "");
+      const compactWindow = (Number(win.outerWidth) || 0) <= 1000 && (Number(win.outerHeight) || 0) <= 1000;
+      return title.startsWith("Extension:") || compactWindow;
+    }
+
+    function bestOverlayWindowExcluding(excludedWin) {
+      let fallback = null;
+      let fullscreen = null;
+      try {
+        const windows = Services.wm.getEnumerator("navigator:browser");
+        while (windows.hasMoreElements()) {
+          const candidate = windows.getNext();
+          if (!candidate || candidate === excludedWin) continue;
+          const uri = String(candidate.gBrowser?.selectedBrowser?.currentURI?.spec || "");
+          if (uri.startsWith("moz-extension://")) continue;
+          if (!fallback) fallback = candidate;
+          if (candidate.fullScreen) fullscreen = candidate;
+        }
+      } catch (e) {}
+      return fullscreen || fallback || getWin();
+    }
+
+    function tryCaptureLeakedExtensionPopupWindow(win) {
+      if (!interceptEnabled || !win) return false;
+      const popupUrl = String(win.gBrowser?.selectedBrowser?.currentURI?.spec || "");
+      if (!isLikelyLeakedExtensionPopupWindow(win, popupUrl)) return false;
+      const target = bestOverlayWindowExcluding(win);
+      suppressExtensionPopupGeometryBriefly();
+      try { win.close(); } catch (e) {}
+      try { target?.focus?.(); } catch (e) {}
+      const scheduler = target?.setTimeout ? target : getWin();
+      try {
+        scheduler?.setTimeout?.(() => {
+          try { target?.focus?.(); } catch (e) {}
+          openExtensionPopupByUrl(popupUrl).catch(() => {});
+        }, 0);
+      } catch (e) {
+        openExtensionPopupByUrl(popupUrl).catch(() => {});
+      }
+      return true;
+    }
+
+    function installExtensionPopupWindowFallback() {
+      const ww = Services.ww;
+      if (!ww || extensionPopupWindowFallbackListener) return;
+      const listener = {
+        observe(subject, topic) {
+          if (topic !== "domwindowopened") return;
+          const win = subject;
+          const target = bestOverlayWindowExcluding(win);
+          const schedule = target?.setTimeout ? target : getWin();
+          for (const delay of [0, 50, 150, 350]) {
+            try {
+              schedule?.setTimeout?.(() => {
+                tryCaptureLeakedExtensionPopupWindow(win);
+              }, delay);
+            } catch (e) {}
+          }
+        },
+      };
+      try {
+        ww.registerNotification(listener);
+        extensionPopupWindowFallbackListener = listener;
+        context.callOnClose({
+          close() {
+            try { ww.unregisterNotification(listener); } catch (e) {}
+            if (extensionPopupWindowFallbackListener === listener) {
+              extensionPopupWindowFallbackListener = null;
+            }
+          },
+        });
+      } catch (e) {}
+    }
+
+    installExtensionPopupWindowFallback();
+
     // Services.ww.openWindow is non-writable/non-configurable on the XPCOM
     // wrapper, so direct assignment is silently rejected and defineProperty
     // throws. We replace Services.ww itself with a Proxy on an empty target
@@ -2131,16 +2286,28 @@ this.zenWorkspaces = class extends ExtensionAPI {
       }
       return origOpenWindow(parent, urlOrNull, name, features, args);
     };
+    let wwProxy = null;
+    function installExtensionPopupWindowOpenIntercept() {
+      if (Services.ww?.openWindow === wrappedOpenWindow) return true;
+      if (!wwProxy) {
+        wwProxy = new Proxy(Object.create(null), {
+          get(_t, p) {
+            if (p === "openWindow") return wrappedOpenWindow;
+            const v = origWw[p];
+            return typeof v === "function" ? v.bind(origWw) : v;
+          },
+          has(_t, p) { return p in origWw; },
+        });
+      }
+      try {
+        Object.defineProperty(Services, "ww", { value: wwProxy, configurable: true, writable: true });
+        return Services.ww?.openWindow === wrappedOpenWindow;
+      } catch (e) {
+        return false;
+      }
+    }
     try {
-      const wwProxy = new Proxy(Object.create(null), {
-        get(_t, p) {
-          if (p === "openWindow") return wrappedOpenWindow;
-          const v = origWw[p];
-          return typeof v === "function" ? v.bind(origWw) : v;
-        },
-        has(_t, p) { return p in origWw; },
-      });
-      Object.defineProperty(Services, "ww", { value: wwProxy, configurable: true, writable: true });
+      installExtensionPopupWindowOpenIntercept();
       context.callOnClose({
         close() {
           try {
@@ -2150,8 +2317,7 @@ this.zenWorkspaces = class extends ExtensionAPI {
       });
     } catch (e) {
       // If we can't replace Services.ww in this Firefox build, the
-      // interception is silently disabled. The setting will appear
-      // checked but have no effect — better than crashing the addon.
+      // notification fallback above still catches leaked popup windows.
     }
 
     // Build the overlay DOM hidden. ChordSession calls this to
@@ -8010,6 +8176,9 @@ this.zenWorkspaces = class extends ExtensionAPI {
         // pushes this from the interceptExtensionPopups setting.
         async setExtensionPopupIntercept(enabled) {
           interceptEnabled = !!enabled;
+          if (interceptEnabled) {
+            installExtensionPopupWindowOpenIntercept();
+          }
         },
 
         // Toggle capture of browser-action launches (toolbar icon clicks,
