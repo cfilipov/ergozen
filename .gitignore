@@ -1,4 +1,5 @@
 *.xpi
 .DS_Store
+CLAUDE.local.md
 dist/
 node_modules/

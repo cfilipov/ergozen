@@ -111,6 +111,17 @@ this.zenWorkspaces = class extends ExtensionAPI {
       return Services.wm.getMostRecentWindow("navigator:browser");
     }
 
+    // Firefox 155 rejects moz-extension:// URLs passed to plain
+    // loadSubScript, even from an Experiment API running with chrome
+    // privileges. These scripts are packaged with this extension, so opt in
+    // explicitly when loading them into their isolated scopes.
+    function loadExtensionSubScript(path, target) {
+      Services.scriptloader.loadSubScriptWithOptions(
+        context.extension.getURL(path),
+        { target, allowUnsafeURL: true }
+      );
+    }
+
     function findTabByDomId(domId) {
       const w = getWin();
       if (!w) return null;
@@ -1081,56 +1092,23 @@ this.zenWorkspaces = class extends ExtensionAPI {
     // chrome/content key listeners are capture-only shims that suppress
     // local keydowns and forward normalized keys into ChordSession.
     const chordSupportScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("shared/keybindings.js"),
-      chordSupportScope
-    );
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("shared/constants.js"),
-      chordSupportScope
-    );
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("shared/navigation-url.js"),
-      chordSupportScope
-    );
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("shared/chord-tree.js"),
-      chordSupportScope
-    );
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("shared/chord-shim.js"),
-      chordSupportScope
-    );
+    loadExtensionSubScript("shared/keybindings.js", chordSupportScope);
+    loadExtensionSubScript("shared/constants.js", chordSupportScope);
+    loadExtensionSubScript("shared/navigation-url.js", chordSupportScope);
+    loadExtensionSubScript("shared/chord-tree.js", chordSupportScope);
+    loadExtensionSubScript("shared/chord-shim.js", chordSupportScope);
     const chordSessionScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/chord-session.js"),
-      chordSessionScope
-    );
+    loadExtensionSubScript("experiment/chord-session.js", chordSessionScope);
     const chordKeyIngressScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/chord-key-ingress.js"),
-      chordKeyIngressScope
-    );
+    loadExtensionSubScript("experiment/chord-key-ingress.js", chordKeyIngressScope);
     const overlayControllerScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/overlay-controller.js"),
-      overlayControllerScope
-    );
+    loadExtensionSubScript("experiment/overlay-controller.js", overlayControllerScope);
     const popupReadinessGuardScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/popup-readiness-guard.js"),
-      popupReadinessGuardScope
-    );
+    loadExtensionSubScript("experiment/popup-readiness-guard.js", popupReadinessGuardScope);
     const domainCloseScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/domain-close.js"),
-      domainCloseScope
-    );
+    loadExtensionSubScript("experiment/domain-close.js", domainCloseScope);
     const workspaceActionCoordinatorScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/workspace-action-coordinator.js"),
-      workspaceActionCoordinatorScope
-    );
+    loadExtensionSubScript("experiment/workspace-action-coordinator.js", workspaceActionCoordinatorScope);
     const KEYBINDINGS = chordSupportScope.ZEN_KEYBINDINGS || [];
     const ACTION_SECTIONS = chordSupportScope.ZEN_ACTION_SECTIONS || [];
     const WORKSPACE_DIGIT_CHORDS = chordSupportScope.ZEN_WORKSPACE_DIGIT_CHORDS || [];
@@ -1148,10 +1126,7 @@ this.zenWorkspaces = class extends ExtensionAPI {
       return (KEYBINDINGS || []).find((node) => node && node.kind === "prefix" && node.view === view) || null;
     }
     const tabIndexScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/tab-index.js"),
-      tabIndexScope
-    );
+    loadExtensionSubScript("experiment/tab-index.js", tabIndexScope);
     const tabIndex = tabIndexScope.createZenTabIndex({
       getWin,
       getAllTabElements,
@@ -1165,26 +1140,17 @@ this.zenWorkspaces = class extends ExtensionAPI {
       isDuplicateNavigationUrl: chordSupportScope.isDuplicateNavigationUrl,
     });
     const recentsModelScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/recents-model.js"),
-      recentsModelScope
-    );
+    loadExtensionSubScript("experiment/recents-model.js", recentsModelScope);
     const recentsModel = recentsModelScope.createZenRecentsModel({ tabIndex });
     const actionsModelScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/actions-model.js"),
-      actionsModelScope
-    );
+    loadExtensionSubScript("experiment/actions-model.js", actionsModelScope);
     const actionsModel = actionsModelScope.createZenActionsModel({
       sectionDefs: ACTION_SECTIONS,
       navigationTree: KEYBINDINGS,
       displayKey: chordSupportScope.zenDisplayKey,
     });
     const workspacesModelScope = {};
-    Services.scriptloader.loadSubScript(
-      context.extension.getURL("experiment/workspaces-model.js"),
-      workspacesModelScope
-    );
+    loadExtensionSubScript("experiment/workspaces-model.js", workspacesModelScope);
     const workspacesModel = workspacesModelScope.createZenWorkspacesModel({
       getWorkspaceRows,
       getWorkspaceTabCounts: () => tabIndex.getWorkspaceTabCounts(),
@@ -4986,8 +4952,8 @@ this.zenWorkspaces = class extends ExtensionAPI {
         "var __duplicateInterceptEnabled = true;\n" +
         "var __duplicateUrlCache = Object.create(null);\n" +
         "try {\n" +
-        "  Services.scriptloader.loadSubScript(" + JSON.stringify(constantsURL) + ", __scope);\n" +
-        "  Services.scriptloader.loadSubScript(" + JSON.stringify(shimURL) + ", __scope);\n" +
+        "  Services.scriptloader.loadSubScriptWithOptions(" + JSON.stringify(constantsURL) + ", { target: __scope, allowUnsafeURL: true });\n" +
+        "  Services.scriptloader.loadSubScriptWithOptions(" + JSON.stringify(shimURL) + ", { target: __scope, allowUnsafeURL: true });\n" +
         "} catch (err) {\n" +
         "  try { if (content && content.__zenTabsPanelChordEngineGen === __GEN) content.__zenTabsPanelChordEngineGen = null; } catch(e){}\n" +
         "  return;\n" +
